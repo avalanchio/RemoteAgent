@@ -6,7 +6,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import traceback
 import urllib.parse
 from time import time, sleep
 
@@ -39,15 +38,9 @@ def execute_cmd(cmd, timeout = None, env = None):
         response["stderr"] = to_str(sp.stderr)
         response["return_code"] = sp.returncode
         response["status"] = "Success"
-    except subprocess.TimeoutExpired as e:
-        response["status"] = "TimedOut"
-        response["stdout"] = to_str(e.stdout)
-        response["stderr"] = to_str(e.stderr)
     except Exception as e:
         response["status"] = "Failed"
         response["message"] = str(e)
-        stack = traceback.format_exc()
-        response.update({'stack': stack, 'message': str(e), "status": "Failed", 'error_type': str(type(e))})
     return response
 
 def execute_python_script(working_directory:str, input_data:dict, code:str):
@@ -88,10 +81,9 @@ def execute_python_script(working_directory:str, input_data:dict, code:str):
                        main()
                    except Exception as e:
                        stack = traceback.format_exc()
-                       error_dict = dict(status = 'Failed', message = str(e) or str(type(e)), stack = stack, error_type=str(type(e)))
+                       error_dict = dict(status = 'Failed', stderr = stack, error_type=str(type(e)))
                        with open('''{error_file}''', 'w') as f:
                            json.dump(error_dict, f)
-                       traceback.print_stack()
            """
     clean_code = inspect.cleandoc(code)
     with open(executor_file, "w") as f:
@@ -104,6 +96,9 @@ def execute_python_script(working_directory:str, input_data:dict, code:str):
         if os.path.isfile(output_file):
             with open(output_file) as f:
                 res['response'] = f.read()
+        elif os.path.isfile(error_file):
+            with open(error_file) as f:
+                res.update(json.load(f))
         return res
     finally:
         os.chdir(current_directory)
@@ -268,28 +263,29 @@ class BackgroundTaskProcessor:
         Main processing loop to continuously check for tasks.
         """
         assert isinstance(self.topic, str), "Task topic is not set"
-        print(f"Background Task Processor started. Base URL: {self.server_url}")
-
+        pid = os.getpid()
+        print(f"Background Task Processor started. Base URL: {self.server_url}, process id: {pid}")
         while True:
             try:
-                self.loop_task()
                 sleep(self.poll_interval)
+                self.loop_task()
             except KeyboardInterrupt:
                 print("\nTask processor stopped by user.")
                 break
             except Exception as e:
                 print(f"Unexpected error: {e}")
-                sleep(self.poll_interval)
 
 
 def main():
     server_url = os.getenv("AIO_BASE_URL", "http://localhost:8080")
     token = os.getenv("AIO_TOKEN")
     topic = os.getenv("AIO_AGENT_TOPIC", "user")
+    poll_interval = float(os.getenv("AGENT_POLL_INTERVAL", "1.0"))
+    max_retries = int(os.getenv("AGENT_MAX_RETRIES", "100"))
     if not token:
         print("AIO_TOKEN is not found. Set the environment variable with the token.")
         exit(1)
-    processor = BackgroundTaskProcessor(server_url, token, topic, poll_interval=1.0, max_retries=100)
+    processor = BackgroundTaskProcessor(server_url, token, topic, poll_interval=poll_interval, max_retries=max_retries)
     processor.run()
 
 

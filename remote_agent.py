@@ -71,9 +71,9 @@ def execute_python_script(working_directory:str, input_data:dict, code:str):
                    if isinstance(output, dict):
                        with open('''{output_file}''', "w") as f:
                            json.dump(output, f, default=str)
-                   elif isinstance(output, str):
+                   elif output is not None:
                        with open('''{output_file}''', "w") as f:
-                           f.write(output)
+                           f.write(str(output))
 
 
                if __name__ == "__main__":

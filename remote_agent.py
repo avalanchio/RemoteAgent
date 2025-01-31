@@ -4,16 +4,41 @@ import json
 import os
 import shlex
 import shutil
+import ssl
 import subprocess
 import sys
 import urllib.parse
 from time import time, sleep
+import pathlib
+import configparser
+import threading
 
 """
 This is simple avalanchio agent. 
 It must always be dependent on the core libraries only without any external dependencies.
 It polls task queue and executes it. 
 """
+################# Update the settings for this script ##############################
+token = None
+base_url = None
+topic = "user"
+disable_ssl_verification = True
+###################################################################################
+
+
+def connection_info(profile = None):
+    token_ = os.getenv("AIO_TOKEN")
+    base_url_ = os.getenv("AIO_BASE_URL")
+    ini_file = os.path.join(pathlib.Path.home(), "aio", "avalanchio.ini")
+    if os.path.exists(ini_file):
+        config = configparser.ConfigParser()
+        config.read(ini_file)
+        section = config.defaults() if profile is None else config[profile]
+        if token_ is None and "authorization" in section:
+            token_ = section["authorization"]
+        if base_url_ is None and "base_url" in section:
+            base_url_ = section["base_url"]
+    return token_, base_url_
 
 current_directory = os.getcwd()
 tmp_directory = os.getenv('AIO_TMP_DIRECTORY', f"{current_directory}/tmp")
@@ -196,7 +221,11 @@ class BackgroundTaskProcessor:
     def make_conn(self):
         # Choose connection based on URL
         if self.scheme == 'https':
-            conn = http.client.HTTPSConnection(self.host)
+            ctx = ssl.create_default_context()
+            if disable_ssl_verification:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            conn = http.client.HTTPSConnection(self.host, context=ctx)
         else:
             conn = http.client.HTTPConnection(self.host)
         return conn
@@ -245,8 +274,18 @@ class BackgroundTaskProcessor:
     def save_result(self, task_id:int, result:dict):
         return self._make_request_raw("POST", f"/api/v1/remote-agent/{task_id}/response", body = result)
 
-    def loop_task(self):
+    def is_task_stopped(self, task_id):
+        res = self._make_request_raw("GET", f"/api/v1/remote-agent/{task_id}/is-stopped")
+        return res and res.get('value')
 
+    def check_status_loop(self, task_id:int, stop: threading.Event):
+        while not stop.is_set():
+            sleep(3.0)
+            self.is_task_stopped(task_id)
+        stop.set()
+
+
+    def loop_task(self):
         # Fetch tasks from server
         task = self.find_task(self.topic)
         if task :
@@ -254,8 +293,15 @@ class BackgroundTaskProcessor:
             print(f"Processing task: {task.get('type')}, id: {task_id}")
             result = self.acknowledge_task(task_id)
             assert result.get('status') == 'Success', f'Failed to acknowledge task: {task}'
-            result = execute_task(task)
+            stop = threading.Event()
+            t = threading.Thread(target=self.check_status_loop, args=(task_id, stop))
+            t.start()
+            try:
+                result = execute_task(task)
+            finally:
+                stop.set()
             self.save_result(task_id, result)
+            t.join()
             print(f"Completed task {task_id}")
 
     def run(self):
@@ -277,15 +323,17 @@ class BackgroundTaskProcessor:
 
 
 def main():
-    server_url = os.getenv("AIO_BASE_URL", "http://localhost:8080")
-    token = os.getenv("AIO_TOKEN")
-    topic = os.getenv("AIO_AGENT_TOPIC", "user")
+    global token, base_url, topic
+    if not(token and base_url):
+        token, base_url = connection_info()
+    if not topic:
+        topic = os.getenv("AIO_AGENT_TOPIC", "user")
     poll_interval = float(os.getenv("AGENT_POLL_INTERVAL", "1.0"))
     max_retries = int(os.getenv("AGENT_MAX_RETRIES", "100"))
     if not token:
         print("AIO_TOKEN is not found. Set the environment variable with the token.")
         exit(1)
-    processor = BackgroundTaskProcessor(server_url, token, topic, poll_interval=poll_interval, max_retries=max_retries)
+    processor = BackgroundTaskProcessor(base_url, token, topic, poll_interval=poll_interval, max_retries=max_retries)
     processor.run()
 
 

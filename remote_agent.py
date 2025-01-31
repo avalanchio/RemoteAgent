@@ -21,6 +21,8 @@ It polls task queue and executes it.
 ################# Update the settings for this script ##############################
 token = None
 base_url = None
+
+# Valid topic: user, rule. Set the topic to rule to enable rule playbook execution.
 topic = "user"
 disable_ssl_verification = True
 ###################################################################################
@@ -137,7 +139,7 @@ def execute_task(task_data:dict):
     :return: Execution result
     """
     # Extract task type and input
-    task_type = task_data.get('type')
+    task_type = (task_data.get('type') or '').lower()
     task_id = task_data.get('id')
 
     code = task_data.get('code')
@@ -174,7 +176,7 @@ def execute_task(task_data:dict):
             # Optional: Clean up output directory
             shutil.rmtree(working_directory)
     else:
-        raise RuntimeError('Unsupported task type: {task_type}')
+        raise RuntimeError(f'Unsupported task type: {task_type}')
 
 
 class BackgroundTaskProcessor:
@@ -189,6 +191,7 @@ class BackgroundTaskProcessor:
         """
         self.server_url = server_url
         self.poll_interval = poll_interval
+        self.last_task_time = None
         self.max_retries = max_retries
         self.topic = topic
         self.conn = None
@@ -289,6 +292,7 @@ class BackgroundTaskProcessor:
         # Fetch tasks from server
         task = self.find_task(self.topic)
         if task :
+            self.last_task_time = time()
             task_id = task.get('id')
             print(f"Processing task: {task.get('type')}, id: {task_id}")
             result = self.acknowledge_task(task_id)
@@ -311,9 +315,11 @@ class BackgroundTaskProcessor:
         assert isinstance(self.topic, str), "Task topic is not set"
         pid = os.getpid()
         print(f"Background Task Processor started. Base URL: {self.server_url}, process id: {pid}")
+        print(f"Watching for tasks in queue: {self.topic}")
         while True:
             try:
-                sleep(self.poll_interval)
+                if self.last_task_time is None or (time() - self.last_task_time) > self.poll_interval:
+                    sleep(self.poll_interval)
                 self.loop_task()
             except KeyboardInterrupt:
                 print("\nTask processor stopped by user.")

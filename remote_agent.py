@@ -11,21 +11,30 @@ import urllib.parse
 from time import time, sleep
 import pathlib
 import configparser
-import threading
+import multiprocessing as mp
 
 """
 This is simple avalanchio agent. 
 It must always be dependent on the core libraries only without any external dependencies.
 It polls task queue and executes it. 
+
+topic: Optional field to pull data from a specific queue. 
+       Valid topic: user, rule. Set the topic to rule to enable rule playbook execution
+       If you do not specify any topic, any type of task would be executed
+       You can run multiple remote_agent for task parallelism 
 """
-################# Update the settings for this script ##############################
+############## Update the settings in section based on your requirement ##########
 token = None
 base_url = None
-
-# Valid topic: user, rule. Set the topic to rule to enable rule playbook execution.
-topic = "user"
+topic = None
 disable_ssl_verification = True
+delete_working_directory = False
+num_workers = 4
+task_timeout_second = None
 ###################################################################################
+
+current_directory = os.getcwd()
+tmp_directory = os.getenv('AIO_TMP_DIRECTORY', os.path.join(current_directory, "tmp"))
 
 
 def connection_info(profile = None):
@@ -42,8 +51,7 @@ def connection_info(profile = None):
             base_url_ = section["base_url"]
     return token_, base_url_
 
-current_directory = os.getcwd()
-tmp_directory = os.getenv('AIO_TMP_DIRECTORY', f"{current_directory}/tmp")
+
 
 def to_str(s):
     if isinstance(s,str):
@@ -89,11 +97,12 @@ def execute_python_script(working_directory:str, input_data:dict, code:str):
                import sys
                import os.path
                import base64
-
                
-               def main():    
+               input_s = '''{input_s}'''
+               
+               try:
                    from task_script import process
-                   input_data = json.loads('''{input_s}''')
+                   input_data = json.loads(input_s)
                    output = process(input_data)
                    if isinstance(output, dict):
                        with open('''{output_file}''', "w") as f:
@@ -101,16 +110,11 @@ def execute_python_script(working_directory:str, input_data:dict, code:str):
                    elif output is not None:
                        with open('''{output_file}''', "w") as f:
                            f.write(str(output))
-
-
-               if __name__ == "__main__":
-                   try:
-                       main()
-                   except Exception as e:
-                       stack = traceback.format_exc()
-                       error_dict = dict(status = 'Failed', stderr = stack, error_type=str(type(e)))
-                       with open('''{error_file}''', 'w') as f:
-                           json.dump(error_dict, f)
+               except Exception as e:
+                   stack = traceback.format_exc()
+                   error_dict = dict(status = 'Failed', stderr = stack, error_type=str(type(e)))
+                   with open('''{error_file}''', 'w') as f:
+                       json.dump(error_dict, f)
            """
     clean_code = inspect.cleandoc(code)
     with open(executor_file, "w") as f:
@@ -162,7 +166,8 @@ def execute_task(task_data:dict):
     elif task_type == 'python':
         # Execute Python script
         working_directory = os.path.join(tmp_directory, str(task_id))
-        print(f"Executing python task: {task_id}, working directory: {working_directory}")
+        pid = os.getpid()
+        print(f"Executing python task: {task_id}, working directory: {working_directory}, pid: {pid}")
         os.makedirs(working_directory)
         try:
             params = task_data.get('data')
@@ -174,14 +179,15 @@ def execute_task(task_data:dict):
             return result
         finally:
             # Optional: Clean up output directory
-            shutil.rmtree(working_directory)
+            if delete_working_directory:
+                shutil.rmtree(working_directory)
     else:
         raise RuntimeError(f'Unsupported task type: {task_type}')
 
 
 class BackgroundTaskProcessor:
 
-    def __init__(self, server_url, token:str, topic:str, poll_interval:float, max_retries = 100):
+    def __init__(self, server_url, poll_interval:float, max_retries = 100):
         """
         Initialize the background task processor.
 
@@ -199,6 +205,8 @@ class BackgroundTaskProcessor:
         self.host = None
         self.scheme = None
         self.parse_url(server_url)
+        self.running_processes = list()
+        self.last_poll_ts = 0.0
 
     def parse_url(self, url):
         """
@@ -257,7 +265,7 @@ class BackgroundTaskProcessor:
         finally:
             self.conn.close()
 
-    def find_task(self, topic:str)->dict:
+    def find_task(self, topic:str = None)->dict:
         """
         Make HTTP request to server to fetch tasks.
 
@@ -265,62 +273,69 @@ class BackgroundTaskProcessor:
         """
         path = "/api/v1/remote-agent/poll"
         for attempt in range(self.max_retries):
+            params = dict()
+            if topic:
+                params['topic'] = topic
             try:
-                return self._make_request_raw('GET', path, dict(topic = topic))
+                return self._make_request_raw('GET', path, params)
             except Exception as e:
                 print(f"Request attempt {attempt + 1} failed: {e}")
                 sleep(5)  # Wait before retry
 
     def acknowledge_task(self, task_id:int):
-        return self._make_request_raw("PATCH", f"/api/v1/remote-agent/ack/{task_id}")
+        return self._make_request_raw("PATCH", f"/api/v1/remote-agent/{task_id}/ack")
 
     def save_result(self, task_id:int, result:dict):
         return self._make_request_raw("POST", f"/api/v1/remote-agent/{task_id}/response", body = result)
 
-    def is_task_stopped(self, task_id):
-        res = self._make_request_raw("GET", f"/api/v1/remote-agent/{task_id}/is-stopped")
-        return res and res.get('value')
+    # def is_task_stopped(self, task_id):
+    #     res = self._make_request_raw("GET", f"/api/v1/remote-agent/{task_id}/is-stopped")
+    #     return res and res.get('value')
+    #
+    # def check_status_loop(self, task_id:int, stop: threading.Event):
+    #     while not stop.is_set():
+    #         sleep(3.0)
+    #         self.is_task_stopped(task_id)
+    #     stop.set()
 
-    def check_status_loop(self, task_id:int, stop: threading.Event):
-        while not stop.is_set():
-            sleep(3.0)
-            self.is_task_stopped(task_id)
-        stop.set()
 
-
-    def loop_task(self):
-        # Fetch tasks from server
-        task = self.find_task(self.topic)
-        if task :
-            self.last_task_time = time()
-            task_id = task.get('id')
-            print(f"Processing task: {task.get('type')}, id: {task_id}")
-            result = self.acknowledge_task(task_id)
-            assert result.get('status') == 'Success', f'Failed to acknowledge task: {task}'
-            stop = threading.Event()
-            t = threading.Thread(target=self.check_status_loop, args=(task_id, stop))
-            t.start()
-            try:
-                result = execute_task(task)
-            finally:
-                stop.set()
-            self.save_result(task_id, result)
-            t.join()
-            print(f"Completed task {task_id}")
+    def loop_task(self, task:dict):
+        task_id = task.get('id')
+        start_time = time()
+        result = self.acknowledge_task(task_id)
+        assert result.get('status') == 'Success', f'Failed to acknowledge task: {task}'
+        result = execute_task(task)
+        self.save_result(task_id, result)
+        duration = time()-start_time
+        print(f"Completed task {task_id}, duration: {duration:.2f}sec")
 
     def run(self):
         """
         Main processing loop to continuously check for tasks.
         """
-        assert isinstance(self.topic, str), "Task topic is not set"
         pid = os.getpid()
         print(f"Background Task Processor started. Base URL: {self.server_url}, process id: {pid}")
         print(f"Watching for tasks in queue: {self.topic}")
+        print(f"Working directory: {tmp_directory}")
         while True:
             try:
-                if self.last_task_time is None or (time() - self.last_task_time) > self.poll_interval:
+                for p in self.running_processes:
+                    if isinstance(task_timeout_second, float) and time()-p[2]>task_timeout_second:
+                        p[1].kill()
+                    # if not p[1].is_alive():
+                    #     p[1].close()
+                self.running_processes = [r for r in self.running_processes if r[1].is_alive()]
+                if len(self.running_processes) >= num_workers:
+                    sleep(0.1)
+                    continue
+                task = self.find_task(self.topic)
+                if task:
+                    self.last_task_time = time()
+                    proc = mp.Process(target=self.loop_task, args=(task,))
+                    proc.start()
+                    self.running_processes.append((task, proc, time()))
+                else:
                     sleep(self.poll_interval)
-                self.loop_task()
             except KeyboardInterrupt:
                 print("\nTask processor stopped by user.")
                 break
@@ -332,14 +347,12 @@ def main():
     global token, base_url, topic
     if not(token and base_url):
         token, base_url = connection_info()
-    if not topic:
-        topic = os.getenv("AIO_AGENT_TOPIC", "user")
     poll_interval = float(os.getenv("AGENT_POLL_INTERVAL", "1.0"))
     max_retries = int(os.getenv("AGENT_MAX_RETRIES", "100"))
     if not token:
         print("AIO_TOKEN is not found. Set the environment variable with the token.")
         exit(1)
-    processor = BackgroundTaskProcessor(base_url, token, topic, poll_interval=poll_interval, max_retries=max_retries)
+    processor = BackgroundTaskProcessor(base_url, poll_interval=poll_interval, max_retries=max_retries)
     processor.run()
 
 
